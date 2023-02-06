@@ -1,100 +1,113 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::net::SocketAddr;
-use Acceptor::{Value, Promise};
-use anyhow::{Result, Context};
+use acceptor::{Value, Promise};
+use proposer::Propose;
+use anyhow::Result;
 use axum::{routing::post, Json, Extension};
+use axum_macros::debug_handler;
 use clap::Parser;
-use serde::{Serialize, Deserialize};
+use tokio::sync::Mutex;
 
 #[derive(Parser, Debug)]
 struct Args {
     #[arg(long)]
-    id: usize
+    id: u64
 }
 
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
 
+    let nodes = [
+        (0, "0.0.0.0:8000"),
+        (1, "0.0.0.0:8001"),
+        (2, "0.0.0.0:8002")
+    ];
+
+    let current_addr = nodes[args.id as usize].1;
+
+    let nodes: Vec<(u64, &'static str)> = nodes.into_iter()
+        .filter(|(id, _)| *id != args.id)
+        .collect();
+
     let config = Config::new(
         args.id,
-        Vec::from([
-            (1, "http://0.0.0.0:8000"),
-            (2, "http://0.0.0.0:8001"),
-            (3, "http://0.0.0.0:8002")
-        ])
+        nodes
     );
 
     let paxos = Paxos::new(config);
 
     let router = axum::Router::new()
         .route("/", post(client_propose))
-        .route("/acceptor/promise", post(acceptor_promise));
+        .route("/acceptor/handle-prepare-message", post(handle_prepare_message))
+        .route("/acceptor/handle-propose", post(handle_propose))
+        .layer(Extension(Arc::new(Mutex::new(paxos))));
 
-    axum::Server::bind(&config.get_current_node().unwrap().addr)
+    println!("listening on {current_addr}");
+
+    axum::Server::bind(&current_addr.parse().unwrap())
         .serve(router.into_make_service())
         .await
         .unwrap();
 }
 
-async fn client_propose(Extension(paxos): Extension<Arc<Mutex<Paxos>>>, Json(payload): Json<serde_json::Value>) -> Result<(), Box<dyn std::error::Error>> {
-    let value = payload.get("value").context("poggers")?.to_string();
+#[debug_handler]
+async fn client_propose(Extension(paxos): Extension<Arc<Mutex<Paxos>>>, value: String) -> Result<String, String> {
+    println!("Received propose with value<{value}>");
 
-    let mut paxos = paxos.try_lock().unwrap();
+    let mut paxos = paxos.lock().await;
 
-    paxos.proposer.prepare(value);
+    paxos.proposer
+        .prepare(value.clone()).await
+        .map_err(|err| err.to_string())?;
 
-    Ok(())
+    Ok(format!("Accepted {value}"))
 }
 
-#[derive(Deserialize)]
-struct PrepareMessage {
-    pub id: usize,
-    pub value: Value
-}
-
-async fn acceptor_promise(Extension(paxos): Extension<Arc<Mutex<Paxos>>>, Json(prepare_message): Json<PrepareMessage>) -> Result<Json<Promise>, String> {
-    let paxos = paxos.try_lock().unwrap();
+#[debug_handler]
+async fn handle_prepare_message(Extension(paxos): Extension<Arc<Mutex<Paxos>>>, prepare_id: String) -> Result<Json<Promise>, String> {
+    let mut paxos = paxos.lock().await;
  
-    match paxos.acceptor.promise(prepare_message.value) {
+    match paxos.acceptor.handle_prepare(prepare_id.parse::<u64>().map_err(|err| err.to_string())?) {
         Ok(promise) => Ok(Json(promise)),
         Err(err) => Err(err.to_string())
     }
 }
 
-#[derive(Debug)]
-struct Node {
-    pub id: usize,
+async fn handle_propose(Extension(paxos): Extension<Arc<Mutex<Paxos>>>, Json(propose): Json<Propose>) -> Result<Json<Value>, String> {
+    let mut paxos = paxos.lock().await;
+
+    match paxos.acceptor.handle_propose(propose) {
+        Ok(value) => Ok(Json(value)),
+        Err(err) => Err(err.to_string())
+    }
+}
+
+
+#[derive(Clone, Debug)]
+pub struct Node {
+    pub id: u64,
     pub addr: SocketAddr
 }
 
 impl Node {
-    fn new(id: usize, addr: SocketAddr) -> Self {
+    fn new(id: u64, addr: SocketAddr) -> Self {
         Self { id, addr }
+    }
+
+    fn endpoint(&self, path: &str) -> String {
+        format!("http://{}/{}", self.addr, path.trim_start_matches('/'))
     }
 }
 
-#[derive(Debug)]
-struct Config {
-    pub id: usize,
+#[derive(Clone, Debug)]
+pub struct Config {
+    pub id: u64,
     pub nodes: Vec<Node>
 }
 
 impl Config {
-    fn get_current_node(&self) -> Result<&Node> {
-        let node = self
-            .nodes
-            .iter()
-            .filter(|node| node.id == self.id)
-            .next()
-            .context(format!("node with id id={} was not found", self.id))?;
-
-        Ok(node)
-    }
-}
-
-impl Config {
-    fn new(id: usize, addresses: Vec<(usize, &'static str)>) -> Self {
+    fn new(id: u64, addresses: Vec<(u64, &'static str)>) -> Self {
         let mut nodes = Vec::new();
 
         for (id, addr) in addresses {
@@ -106,29 +119,28 @@ impl Config {
 }
 
 struct Paxos {
-    pub config: Config,
-    pub proposer: Proposer::Proposer,
-    pub acceptor: Acceptor::Acceptor,
+    pub proposer: proposer::Proposer,
+    pub acceptor: acceptor::Acceptor,
 }
 
 impl Paxos {
     fn new(config: Config) -> Self {
         Self { 
-            config, 
-            proposer: Proposer::Proposer::new(config), 
-            acceptor: Acceptor::Acceptor::new(config)
+            proposer: proposer::Proposer::new(config), 
+            acceptor: acceptor::Acceptor::new()
         }
     }
 }
 
-mod Proposer {
+mod proposer {
+    use anyhow::anyhow;
     use serde_json::json;
 
-    use crate::Acceptor::{Value, Promise};
+    use crate::acceptor::{Value, Promise};
     use crate::Config;
 
     pub struct Proposer {
-        pub id: usize,
+        pub id: u64,
         pub config: Config,
         pub promises: Vec<Promise>
     }
@@ -144,65 +156,124 @@ mod Proposer {
     }
 
     impl Proposer {
-        pub fn prepare(&mut self, value: String) {
+        pub async fn prepare(&mut self, value: String) -> anyhow::Result<()> {
             self.id += 1;
-
-            let value = Value { id: self.id, value };
 
             let client = reqwest::Client::new();
 
-            self.config.nodes.iter().map(|node| {
-                client.post(node.addr.to_string())
-                    .body(json!(value).to_string())
+            let reqs = self.config.nodes.iter().map(|node| {
+                client.post(node.endpoint("/acceptor/handle-prepare-message"))
+                    .body(json!(self.id).to_string())
                     .send()
             });
+
+            let result = futures::future::join_all(reqs).await;
+
+            let mut promises = Vec::with_capacity(result.len());
+
+            for result in result.into_iter().flatten() {
+                promises.push(result.json::<Promise>().await?)
+            }            
+            
+            let majority = (self.config.nodes.len() / 2) + 1;
+
+            if promises.len() + 1 < majority {
+                return Err(anyhow!("didn't received promise from majority of acceptors"));
+            }
+
+            let accepted_promise = promises.into_iter()
+                .filter(|Promise(value)| value.value.is_some())
+                .max_by_key(|Promise(value)| value.id);
+ 
+            let has_accepted_value = accepted_promise.is_some();                
+
+            let value = match accepted_promise {
+                Some(value) => value.0.value.unwrap(),
+                None => value
+            };
+
+            let propose = Propose(Value { id: self.id, value: Some(value) });
+
+            let requests = self.config.nodes.iter().map(|node| {
+                client.post(node.endpoint("/acceptor/handle-propose"))
+                    .json(&propose)
+                    .send()
+            });
+
+            let responses = futures::future::join_all(requests).await;
+
+            let mut accepted_values = Vec::with_capacity(responses.len());
+
+            for result in responses.into_iter().flatten() {
+                accepted_values.push(result.json::<Value>().await?);
+            }
+
+            if accepted_values.len() + 1 < majority {
+                return Err(anyhow!("value not accepted by majority"));
+            }
+
+            if has_accepted_value {
+                return Err(anyhow!("already accepted another value"));
+            }
+
+            Ok(())
         }
     }
 
-    #[derive(Clone)]
+    #[derive(Clone, serde::Deserialize, serde::Serialize)]
     pub struct Propose(pub Value);
 }
 
-mod Acceptor {
+mod acceptor {
     use anyhow::{Result, anyhow};
     use serde::{Deserialize, Serialize};
 
-    use crate::{Proposer::Propose, Config, PrepareMessage};
+    use crate::proposer::Propose;
 
     pub struct Acceptor {
-        max_id: usize,
+        max_id: u64,
         accepted_propose: Option<Propose>,
-        config: Config
     }
 
     impl Acceptor {
-        pub fn new(config: Config) -> Self {
-            Self { max_id: 0, accepted_propose: None, config }
+        pub fn new() -> Self {
+            Self { max_id: 0, accepted_propose: None }
         }
-    }
 
-    impl Acceptor {
-        pub fn handle_prepare(&mut self, prepare_message: PrepareMessage) -> Result<Promise> {
-            if prepare_message.id < self.max_id {
+        pub fn handle_prepare(&mut self, prepare_id: u64) -> Result<Promise> {
+            if prepare_id < self.max_id {
                 return Err(anyhow!("already accepted a propose with a higher id"));
             }
 
-            self.max_id = prepare_message.id;
+            self.max_id = prepare_id;
 
-            Ok(Promise(prepare_message.value))
+            if self.accepted_propose.is_some() {
+                let value = self.accepted_propose.clone().unwrap().0.value;
+
+                return Ok(Promise(Value { id: prepare_id, value }));
+            }
+
+            Ok(Promise(Value { id: prepare_id, value: None }))
+        }
+
+
+        pub fn handle_propose(&mut self, propose: Propose) -> Result<Value> {
+            if self.max_id != propose.0.id {
+                return Err(anyhow!("cannot accept propose with lower id"));
+            }
+
+            self.accepted_propose = Some(propose.clone());
+
+            Ok(propose.0)
         }
     }
 
-    pub struct Promise(Value);
-    impl Promise {
-        pub fn new(value: Value) -> Self {
-            Self(value)
-        }
-    }
+    #[derive(serde::Serialize, serde::Deserialize)]
+    pub struct Promise(pub Value);
 
     #[derive(Clone, Deserialize, Serialize)]
     pub struct Value {
-        pub id: usize,
-        pub value: String,
+        pub id: u64,
+        pub value: Option<String>,
     }
 }
