@@ -19,4 +19,5 @@ curl -X POST http://0.0.0.0:8000/ -d "proposed value"
 ## References
 
 https://lamport.azurewebsites.net/pubs/paxos-simple.pdf
+
 https://people.cs.rutgers.edu/~pxk/417/notes/paxos.html
