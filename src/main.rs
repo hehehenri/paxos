@@ -1,8 +1,6 @@
 use std::sync::Arc;
 use std::net::SocketAddr;
-use acceptor::{Value, Promise};
-use proposer::Propose;
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use axum::{routing::post, Json, Extension};
 use axum_macros::debug_handler;
 use clap::Parser;
@@ -19,21 +17,20 @@ async fn main() {
     let args = Args::parse();
 
     let nodes = [
-        (0, "0.0.0.0:8000"),
-        (1, "0.0.0.0:8001"),
-        (2, "0.0.0.0:8002")
+        "0.0.0.0:8000",
+        "0.0.0.0:8001",
+        "0.0.0.0:8002"
     ];
 
-    let current_addr = nodes[args.id as usize].1;
+    let current_addr = nodes[args.id as usize];
 
     let nodes: Vec<(u64, &'static str)> = nodes.into_iter()
-        .filter(|(id, _)| *id != args.id)
+        .enumerate()
+        .filter(|(id, _)| *id as u64 != args.id)
+        .map(|(id, addr)| (id as u64, addr))
         .collect();
 
-    let config = Config::new(
-        args.id,
-        nodes
-    );
+    let config = Config::new(args.id, nodes);
 
     let paxos = Paxos::new(config);
 
@@ -119,161 +116,143 @@ impl Config {
 }
 
 struct Paxos {
-    pub proposer: proposer::Proposer,
-    pub acceptor: acceptor::Acceptor,
+    pub proposer: Proposer,
+    pub acceptor: Acceptor,
 }
 
 impl Paxos {
     fn new(config: Config) -> Self {
         Self { 
-            proposer: proposer::Proposer::new(config), 
-            acceptor: acceptor::Acceptor::new()
+            proposer: Proposer::new(config), 
+            acceptor: Acceptor::default()
         }
     }
 }
 
-mod proposer {
-    use anyhow::anyhow;
-    use serde_json::json;
-
-    use crate::acceptor::{Value, Promise};
-    use crate::Config;
-
-    pub struct Proposer {
-        pub id: u64,
-        pub config: Config,
-        pub promises: Vec<Promise>
-    }
-
-    impl Proposer {
-        pub fn new(config: Config) -> Self {
-            Self {
-                id: 0,
-                config, 
-                promises: Vec::new(),
-            }
-        }
-    }
-
-    impl Proposer {
-        pub async fn prepare(&mut self, value: String) -> anyhow::Result<()> {
-            self.id += 1;
-
-            let client = reqwest::Client::new();
-
-            let reqs = self.config.nodes.iter().map(|node| {
-                client.post(node.endpoint("/acceptor/handle-prepare-message"))
-                    .body(json!(self.id).to_string())
-                    .send()
-            });
-
-            let result = futures::future::join_all(reqs).await;
-
-            let mut promises = Vec::with_capacity(result.len());
-
-            for result in result.into_iter().flatten() {
-                promises.push(result.json::<Promise>().await?)
-            }            
-            
-            let majority = (self.config.nodes.len() / 2) + 1;
-
-            if promises.len() + 1 < majority {
-                return Err(anyhow!("didn't received promise from majority of acceptors"));
-            }
-
-            let accepted_promise = promises.into_iter()
-                .filter(|Promise(value)| value.value.is_some())
-                .max_by_key(|Promise(value)| value.id);
- 
-            let has_accepted_value = accepted_promise.is_some();                
-
-            let value = match accepted_promise {
-                Some(value) => value.0.value.unwrap(),
-                None => value
-            };
-
-            let propose = Propose(Value { id: self.id, value: Some(value) });
-
-            let requests = self.config.nodes.iter().map(|node| {
-                client.post(node.endpoint("/acceptor/handle-propose"))
-                    .json(&propose)
-                    .send()
-            });
-
-            let responses = futures::future::join_all(requests).await;
-
-            let mut accepted_values = Vec::with_capacity(responses.len());
-
-            for result in responses.into_iter().flatten() {
-                accepted_values.push(result.json::<Value>().await?);
-            }
-
-            if accepted_values.len() + 1 < majority {
-                return Err(anyhow!("value not accepted by majority"));
-            }
-
-            if has_accepted_value {
-                return Err(anyhow!("already accepted another value"));
-            }
-
-            Ok(())
-        }
-    }
-
-    #[derive(Clone, serde::Deserialize, serde::Serialize)]
-    pub struct Propose(pub Value);
+pub struct Proposer {
+    pub id: u64,
+    pub config: Config,
+    pub promises: Vec<Promise>
 }
 
-mod acceptor {
-    use anyhow::{Result, anyhow};
-    use serde::{Deserialize, Serialize};
-
-    use crate::proposer::Propose;
-
-    pub struct Acceptor {
-        max_id: u64,
-        accepted_propose: Option<Propose>,
-    }
-
-    impl Acceptor {
-        pub fn new() -> Self {
-            Self { max_id: 0, accepted_propose: None }
-        }
-
-        pub fn handle_prepare(&mut self, prepare_id: u64) -> Result<Promise> {
-            if prepare_id < self.max_id {
-                return Err(anyhow!("already accepted a propose with a higher id"));
-            }
-
-            self.max_id = prepare_id;
-
-            if self.accepted_propose.is_some() {
-                let value = self.accepted_propose.clone().unwrap().0.value;
-
-                return Ok(Promise(Value { id: prepare_id, value }));
-            }
-
-            Ok(Promise(Value { id: prepare_id, value: None }))
-        }
-
-
-        pub fn handle_propose(&mut self, propose: Propose) -> Result<Value> {
-            if self.max_id != propose.0.id {
-                return Err(anyhow!("cannot accept propose with lower id"));
-            }
-
-            self.accepted_propose = Some(propose.clone());
-
-            Ok(propose.0)
+impl Proposer {
+    pub fn new(config: Config) -> Self {
+        Self {
+            id: 0,
+            config, 
+            promises: Vec::new(),
         }
     }
+}
 
-    #[derive(serde::Serialize, serde::Deserialize)]
-    pub struct Promise(pub Value);
+impl Proposer {
+    pub async fn prepare(&mut self, value: String) -> anyhow::Result<()> {
+        self.id += 1;
 
-    #[derive(Clone, Deserialize, Serialize)]
-    pub struct Value {
-        pub id: u64,
-        pub value: Option<String>,
+        let client = reqwest::Client::new();
+
+        let reqs = self.config.nodes.iter().map(|node| {
+            client.post(node.endpoint("/acceptor/handle-prepare-message"))
+                .json(&self.id)
+                .send()
+        });
+
+        let result = futures::future::join_all(reqs).await;
+
+        let mut promises = Vec::with_capacity(result.len());
+
+        for result in result.into_iter().flatten() {
+            promises.push(result.json::<Promise>().await?)
+        }            
+        
+        let majority = (self.config.nodes.len() / 2) + 1;
+
+        if promises.len() + 1 < majority {
+            return Err(anyhow!("didn't received promise from majority of acceptors"));
+        }
+
+        let accepted_promise = promises.into_iter()
+            .filter(|Promise(value)| value.value.is_some())
+            .max_by_key(|Promise(value)| value.id);
+
+        let has_accepted_value = accepted_promise.is_some();                
+
+        let value = match accepted_promise {
+            Some(value) => value.0.value.unwrap(),
+            None => value
+        };
+
+        let propose = Propose(Value { id: self.id, value: Some(value) });
+
+        let requests = self.config.nodes.iter().map(|node| {
+            client.post(node.endpoint("/acceptor/handle-propose"))
+                .json(&propose)
+                .send()
+        });
+
+        let responses = futures::future::join_all(requests).await;
+
+        let mut accepted_values = Vec::with_capacity(responses.len());
+
+        for result in responses.into_iter().flatten() {
+            accepted_values.push(result.json::<Value>().await?);
+        }
+
+        if accepted_values.len() + 1 < majority {
+            return Err(anyhow!("value not accepted by majority"));
+        }
+
+        if has_accepted_value {
+            return Err(anyhow!("already accepted another value"));
+        }
+
+        Ok(())
     }
+}
+
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+pub struct Propose(pub Value);
+
+#[derive(Default)]
+pub struct Acceptor {
+    max_id: u64,
+    accepted_propose: Option<Propose>,
+}
+
+impl Acceptor {
+    pub fn handle_prepare(&mut self, prepare_id: u64) -> Result<Promise> {
+        if prepare_id < self.max_id {
+            return Err(anyhow!("already accepted a propose with a higher id"));
+        }
+
+        self.max_id = prepare_id;
+
+        if self.accepted_propose.is_some() {
+            let value = self.accepted_propose.clone().unwrap().0.value;
+
+            return Ok(Promise(Value { id: prepare_id, value }));
+        }
+
+        Ok(Promise(Value { id: prepare_id, value: None }))
+    }
+
+
+    pub fn handle_propose(&mut self, propose: Propose) -> Result<Value> {
+        if self.max_id != propose.0.id {
+            return Err(anyhow!("cannot accept propose with lower id"));
+        }
+
+        self.accepted_propose = Some(propose.clone());
+
+        Ok(propose.0)
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct Promise(pub Value);
+
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+pub struct Value {
+    pub id: u64,
+    pub value: Option<String>,
 }
